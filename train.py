@@ -1,7 +1,15 @@
 import os
 import tensorflow as tf
 from tensorflow.keras import layers, models
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from tensorflow.keras.applications import EfficientNetB0
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+
+
+# ── Mixed precision for ~2× GPU speedup ──────────────────────────────────────
+tf.keras.mixed_precision.set_global_policy('mixed_float16')
+
+IMAGE_SIZE = (224, 224)
+BATCH_SIZE = 32
 
 
 class DatasetHandler:
@@ -11,32 +19,37 @@ class DatasetHandler:
         self.test_dir = test_dir
         self.val_dir = val_dir
 
-    # ❌ NOT NEEDED (COMMENTED)
-    """
-    def download_dataset(self):
-        pass
-
-    def unzip_dataset(self):
-        pass
-    """
-
-    def get_image_dataset_from_directory(self, dir_name):
+    def get_image_dataset_from_directory(self, dir_name, augment=False):
         dir_path = os.path.join(self.dataset_dir, dir_name)
 
-        return tf.keras.utils.image_dataset_from_directory(
+        ds = tf.keras.utils.image_dataset_from_directory(
             dir_path,
             labels='inferred',
             color_mode='rgb',
             seed=42,
-            batch_size=32,
-            image_size=(128, 128)
+            batch_size=BATCH_SIZE,
+            image_size=IMAGE_SIZE,
         )
 
-    def load_split_data(self):
-        train_data = self.get_image_dataset_from_directory(self.train_dir)
-        test_data = self.get_image_dataset_from_directory(self.test_dir)
-        val_data = self.get_image_dataset_from_directory(self.val_dir)
+        if augment:
+            augmentation = tf.keras.Sequential([
+                layers.RandomFlip('horizontal'),
+                layers.RandomRotation(0.1),
+                layers.RandomZoom(0.1),
+                layers.RandomContrast(0.2),
+                layers.RandomBrightness(0.2),
+            ])
+            ds = ds.map(
+                lambda x, y: (augmentation(x, training=True), y),
+                num_parallel_calls=tf.data.AUTOTUNE
+            )
 
+        return ds.prefetch(tf.data.AUTOTUNE)
+
+    def load_split_data(self):
+        train_data = self.get_image_dataset_from_directory(self.train_dir, augment=True)
+        test_data = self.get_image_dataset_from_directory(self.test_dir, augment=False)
+        val_data = self.get_image_dataset_from_directory(self.val_dir, augment=False)
         return train_data, test_data, val_data
 
 
@@ -45,57 +58,54 @@ class DeepfakeDetectorModel:
         self.model = self._build_model()
 
     def _build_model(self):
-        model = models.Sequential([
-            layers.Input(shape=(128, 128, 3)),
+        # ── EfficientNetB0 backbone (ImageNet pretrained) ──────────────────
+        backbone = EfficientNetB0(
+            include_top=False,
+            weights='imagenet',
+            input_shape=(*IMAGE_SIZE, 3),
+        )
+        backbone.trainable = False  # frozen for Phase 1
 
-            # ✅ FIXED RESCALING
-            layers.Rescaling(1./255),
+        inputs = tf.keras.Input(shape=(*IMAGE_SIZE, 3))
 
-            # ✅ DATA AUGMENTATION
-            layers.RandomFlip("horizontal"),
-            layers.RandomRotation(0.1),
-            layers.RandomZoom(0.1),
+        # EfficientNetB0 expects pixels in [0, 255] — it handles rescaling internally
+        x = backbone(inputs, training=False)
+        x = layers.GlobalAveragePooling2D()(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.Dropout(0.3)(x)
+        # dtype=float32 on final layer to avoid float16 softmax instability
+        outputs = layers.Dense(1, activation='sigmoid', dtype='float32')(x)
 
-            # ✅ LIGHTWEIGHT CNN (faster for hackathon)
-            layers.Conv2D(16, (3, 3), activation='relu', padding='same'),
-            layers.MaxPooling2D(),
-
-            layers.Conv2D(32, (3, 3), activation='relu', padding='same'),
-            layers.MaxPooling2D(),
-
-            layers.Conv2D(64, (3, 3), activation='relu', padding='same'),
-            layers.MaxPooling2D(),
-
-            layers.Flatten(),
-            layers.Dense(128, activation='relu'),
-            layers.Dropout(0.5),
-
-            layers.Dense(1, activation='sigmoid')
-        ])
-
+        model = tf.keras.Model(inputs, outputs)
         return model
 
-    def compile_model(self, learning_rate):
+    def compile_model(self, learning_rate, label_smoothing=0.1):
         optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
-
         self.model.compile(
             optimizer=optimizer,
-            loss='binary_crossentropy',
+            loss=tf.keras.losses.BinaryCrossentropy(label_smoothing=label_smoothing),
             metrics=['accuracy', tf.keras.metrics.Precision(), tf.keras.metrics.Recall()]
         )
 
-    def train_model(self, train_data, val_data, epochs):
-        callbacks = [
-            EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True),
-            ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=3),
-            ModelCheckpoint('best_model.keras', save_best_only=True)
-        ]
+    def unfreeze_top_layers(self, num_layers=30):
+        """Unfreeze the top N layers of the EfficientNetB0 backbone for fine-tuning."""
+        backbone = self.model.layers[1]  # EfficientNetB0 is the second layer
+        backbone.trainable = True
+        for layer in backbone.layers[:-num_layers]:
+            layer.trainable = False
+        print(f'Unfrozen top {num_layers} layers of EfficientNetB0 for fine-tuning.')
 
+    def train_model(self, train_data, val_data, epochs, model_path='deepfake_detector_model.keras'):
+        callbacks = [
+            EarlyStopping(monitor='val_accuracy', patience=5, restore_best_weights=True, mode='max'),
+            ReduceLROnPlateau(monitor='val_loss', factor=0.3, patience=3, min_lr=1e-7),
+            ModelCheckpoint(model_path, monitor='val_accuracy', save_best_only=True, mode='max'),
+        ]
         return self.model.fit(
             train_data,
             validation_data=val_data,
             epochs=epochs,
-            callbacks=callbacks
+            callbacks=callbacks,
         )
 
     def evaluate_model(self, test_data):
@@ -109,22 +119,30 @@ class TrainModel:
     def __init__(self, dataset_dir, train_dir, test_dir, val_dir):
         self.dataset_handler = DatasetHandler(dataset_dir, train_dir, test_dir, val_dir)
 
-    def run_training(self, learning_rate=0.0001, epochs=20):
+    def run_training(self):
         train_data, test_data, val_data = self.dataset_handler.load_split_data()
 
         model = DeepfakeDetectorModel()
-        model.compile_model(learning_rate)
 
-        history = model.train_model(train_data, val_data, epochs)
+        # ── Phase 1: Train classifier head only (backbone frozen) ────────
+        print('\n=== Phase 1: Training classifier head (backbone frozen) ===')
+        model.compile_model(learning_rate=1e-3, label_smoothing=0.1)
+        history_phase1 = model.train_model(train_data, val_data, epochs=10)
+
+        # ── Phase 2: Fine-tune top 30 EfficientNetB0 layers ─────────────
+        print('\n=== Phase 2: Fine-tuning top 30 EfficientNetB0 layers ===')
+        model.unfreeze_top_layers(num_layers=30)
+        model.compile_model(learning_rate=1e-5, label_smoothing=0.0)
+        history_phase2 = model.train_model(train_data, val_data, epochs=20)
+
+        print('\n=== Final Evaluation on Test Set ===')
         evaluation_metrics = model.evaluate_model(test_data)
+        print('Test metrics (loss, accuracy, precision, recall):', evaluation_metrics)
 
-        model.save_model('deepfake_detector_model.keras')
-
-        return history, evaluation_metrics
+        return history_phase1, history_phase2, evaluation_metrics
 
 
 if __name__ == '__main__':
-    # Relative path — works on any machine
     dataset_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'Dataset')
 
     train_dir = 'Train'
@@ -135,9 +153,7 @@ if __name__ == '__main__':
         dataset_dir=dataset_dir,
         train_dir=train_dir,
         test_dir=test_dir,
-        val_dir=val_dir
+        val_dir=val_dir,
     )
 
-    history, evaluation_metrics = trainer.run_training()
-
-    print('evaluation metrics:', evaluation_metrics)
+    trainer.run_training()

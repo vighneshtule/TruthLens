@@ -50,15 +50,16 @@ Uploaded file deleted
 
 | Property | Value |
 |---|---|
-| Architecture | Custom CNN (3 Conv2D blocks) |
-| Input size | 128 × 128 × 3 (RGB) |
+| Architecture | EfficientNetB0 (ImageNet pretrained, fine-tuned) |
+| Input size | 224 × 224 × 3 (RGB) |
+| Training | 2-phase: frozen backbone → fine-tune top 30 layers |
 | Output | Sigmoid (0 = Real, 1 = Fake) |
-| Loss | Binary Crossentropy |
-| Optimizer | Adam (lr = 0.0001) |
-| Test Accuracy | ~88% |
-| Test Precision | ~94% |
-| Training data | ~100,000 images (Kaggle Deepfake & Real Images) |
+| Loss | Binary Crossentropy + label smoothing 0.1 |
+| Optimizer | Adam (Phase 1: 1e-3, Phase 2: 1e-5) |
+| Expected Accuracy | ~95%+ |
+| Training data | ~140,000 images (70k Fake + 70k Real) |
 | Framework | TensorFlow 2.x / Keras |
+| Inference | Test-Time Augmentation (4-variant averaging) |
 
 ---
 
